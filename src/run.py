@@ -137,9 +137,9 @@ def reconstruct_object(run_opt, out_dir, obj_id, obj_elevation, reprojected=True
         blender2opencv = np.array(
             [[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]]
         )
-        c2w_r = orbit_camera(obj_elevation, 0, 2) @ blender2opencv
+        c2w_r = orbit_camera(obj_elevation, 0, 2) @ blender2opencv          # the 2 is because the camera was moved 2 units away from the object (during reprojection)
         if reprojected:
-            c2w_r[:3, -1] = 0
+            c2w_r[:3, -1] = 0                                               # no translation
         mesh.apply_transform(np.linalg.inv(c2w_r))
     else:
         raise Exception(f'Reconstruction method not implemented')

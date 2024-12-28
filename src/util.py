@@ -242,9 +242,9 @@ def rotation_matrix_to_align_vectors(v1, v2):
     if np.linalg.norm(axis) == 0:
         return np.eye(3)
 
-    axis = axis / np.linalg.norm(axis)
-    angle = np.arccos(np.dot(v1, v2))
-    rotation = R.from_rotvec(angle * axis)
+    axis = axis / np.linalg.norm(axis)          # axis about which to rotate - the cross product of the two vectors
+    angle = np.arccos(np.dot(v1, v2))           # angle between the two vectors
+    rotation = R.from_rotvec(angle * axis)      # rotation matrix to align the two vectors - Rodrigues' formula
     rotation_matrix = np.eye(4)
     rotation_matrix[:3, :3] = rotation.as_matrix()
     return rotation_matrix
@@ -258,47 +258,59 @@ def reproject_pixels(image, mask, pts3d, K_crop, K_image, crop_size, edge_th):
     normalization_mat = np.eye(4)
 
     # used to compute a tighter bounding box around the object
-    cam_vec = -mesh.triangles_center.copy()
-    cam_vec /= np.linalg.norm(cam_vec)
-    prod = (cam_vec * np.array(mesh.face_normals)).sum(axis=-1)
+    cam_vec = -mesh.triangles_center.copy()                         # get the vector from mesh to camera origin
+    cam_vec /= np.linalg.norm(cam_vec)                              # normalize the vector
+    prod = (cam_vec * np.array(mesh.face_normals)).sum(axis=-1)     # get the dot product between the view direction and the face normals
+   
+    # trim the mesh to only include the faces that are facing the camera 
     mesh = trimesh.Trimesh(pts3d.reshape(-1, 3), faces=triangles[prod > edge_th], vertex_colors=image[..., :3].reshape(-1, 3))
     mesh.remove_unreferenced_vertices()
 
-    mid_point = (mesh.vertices.min(axis=0) + mesh.vertices.max(axis=0)) / 2
-    mid_point *= pts3d[mask, 2].min() / mid_point[2]
-    mesh.apply_translation(-mid_point)
-    normalization_mat[:3, -1] -= mid_point
+    # Move the mesh to the origin, and rotate it to align midpoint with the z-axis
+    mid_point = (mesh.vertices.min(axis=0) + mesh.vertices.max(axis=0)) / 2     # mid point of the mesh
+    mid_point *= pts3d[mask, 2].min() / mid_point[2]            
+    mesh.apply_translation(-mid_point)                          # translate the mesh to the origin
+    normalization_mat[:3, -1] -= mid_point                      # update the normalization matrix to reflect the translation
 
     rotation = rotation_matrix_to_align_vectors(mid_point, [0, 0, 1])
     mesh.apply_transform(rotation)
     normalization_mat = rotation @ normalization_mat
 
+    # choose the middle 80% of the mesh along the z-axis
     v_mask = np.logical_and(
         mesh.vertices[:, -1] < np.quantile(mesh.vertices[:, -1], 0.9), 
         mesh.vertices[:, -1] > np.quantile(mesh.vertices[:, -1], 0.05)
         )
     vertices = mesh.vertices[v_mask]
 
+    # isotropically scale the mesh such that the dimension with higest extent (among x and y) is scaled to 0 to 1
     scale = 1.0 / np.max((vertices.max(axis=0) - vertices.min(axis=0))[:-1])
     mesh.apply_scale(scale)
     vertices *= scale
     normalization_mat[:3] *= scale
-
+    
+    # translate the mesh to the center of the camera frustum
     translation = -(vertices.min(axis=0) + vertices.max(axis=0)) / 2
     translation[-1] = -(vertices[:, -1].min() + 0.5) 
     mesh.apply_translation(translation)
     normalization_mat[:3, -1] += translation
 
+    # ensure the mesh is within the camera frustum by translating the camera along the z-axis
     c2w_def = np.eye(4)
     c2w_def[:3, -1] = [0, 0, -2]
 
+    # This is what we came for.
     out = intersect_rays_mesh(mesh, K_crop, c2w_def, crop_size)
     inters = trimesh.PointCloud(out[0])
-    inters.apply_transform(np.linalg.inv(normalization_mat))
+    inters.apply_transform(np.linalg.inv(normalization_mat))        # undo ALL transformations to get the points in the original image space
+
+    # reproject the points to the image space
     K = np.eye(4)
     K[:3, :3] = K_image
     inters.apply_transform(K)
     coords = inters[:, :2] / inters[:, 2:]
+
+    # interpolate the colors at the reprojected points
     inters_colors = interpolate_array(image, coords[:, ::-1]).round().clip(0, 255)
     reproj_mask = np.zeros_like(mask, shape=(crop_size, crop_size))
     reproj_img = np.zeros_like(image, shape=(crop_size, crop_size, 3))
@@ -314,10 +326,10 @@ def intersect_rays_mesh(mesh, K_def, c2w_def, crop_size):
     ty = np.linspace(0, crop_size - 1, crop_size)
     pixels_x, pixels_y = np.meshgrid(tx, ty)
     p = np.stack([pixels_x, pixels_y, np.ones_like(pixels_y)], axis=-1)
-    p = np.einsum('ij,mnj->mni', np.linalg.inv(K_def), p)
-    rays_v = p / np.linalg.norm(p, ord=2, axis=-1, keepdims=True)
-    rays_v = np.einsum('ij,mnj->mni', c2w_def[:3, :3], rays_v)
-    rays_o = np.broadcast_to(c2w_def[:3, -1], rays_v.shape)
+    p = np.einsum('ij,mnj->mni', np.linalg.inv(K_def), p)           # apply inverse of intrinsic matrix
+    rays_v = p / np.linalg.norm(p, ord=2, axis=-1, keepdims=True)       # normalize the points and make vectors of rays
+    rays_v = np.einsum('ij,mnj->mni', c2w_def[:3, :3], rays_v)      # apply camera to world matrix (that part is rotation, identity in this case)
+    rays_o = np.broadcast_to(c2w_def[:3, -1], rays_v.shape)         # origin of the rays is the camera position, we kept it at -2 in the z-axis
     intersector = trimesh.ray.ray_pyembree.RayMeshIntersector(mesh)
     out = intersector.intersects_location(rays_o.reshape(-1, 3), rays_v.reshape(-1, 3), multiple_hits=False)
     return out
@@ -476,23 +488,27 @@ def align_to_depth(mask, pts3d, mesh, K_crop, crop_params, crop_size):
 def align_to_depth_rep(obj_mesh, normalization_mat, out_depth, c2w_crop, K_crop, crop_size):
     crop_shape = (crop_size, crop_size)
     w2c_crop = np.linalg.inv(c2w_crop)
-    out_rec = intersect_rays_mesh(obj_mesh, K_crop, c2w_crop, crop_size)
+    out_rec = intersect_rays_mesh(obj_mesh, K_crop, c2w_crop, crop_size)        # The object is at origin, camera at -2 in z-axis
 
     depth_mask = np.zeros(crop_shape, dtype=bool)
-    depth_mask[np.unravel_index(out_depth[1], crop_shape)] = 1
+    depth_mask[np.unravel_index(out_depth[1], crop_shape)] = 1      # rays for which we had intersection - these are the valid points
     rec_mask = np.zeros(crop_shape, dtype=bool)
-    rec_mask[np.unravel_index(out_rec[1], crop_shape)] = 1
+    rec_mask[np.unravel_index(out_rec[1], crop_shape)] = 1          # rays for which we have intersection with the reconstructed mesh
     mask_both = depth_mask & rec_mask
-
+    
+    # get the point clouds for the depth and the reconstructed mesh
     pc_rec = trimesh.PointCloud(out_rec[0][mask_both[np.unravel_index(out_rec[1], crop_shape)]])
     pc_depth = trimesh.PointCloud(out_depth[0][mask_both[np.unravel_index(out_depth[1], crop_shape)]])
 
+    # apply the normalization matrix to the point clouds
     pc_rec.apply_transform(w2c_crop)
     pc_depth.apply_transform(w2c_crop)
-
+    
+    # RANSAC regression to estimate the scale factor
     regressor = RANSACRegressor(estimator=LinearRegression(fit_intercept=False), min_samples=0.2)
     regressor.fit(pc_rec[:, -1:].reshape(-1, 1), pc_depth[:, -1:].reshape(-1, 1))
     transform = w2c_crop.copy()
+    # apply the scale factor to the normalization matrix
     transform[:3] *= regressor.estimator_.coef_[0, 0]
     transform = np.linalg.inv(normalization_mat) @ c2w_crop @ transform
     return transform

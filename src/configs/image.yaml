@@ -1,7 +1,8 @@
+crop_size: 512
 scene:
   type: 'InTheWild'
   attributes:
-    img_path: '../imgs/demo_1.jpg'
+    img_path: '../imgs/unnamed.jpg'
   save_dir: '../out/demo_1'
 run:
   only_foreground: False 
